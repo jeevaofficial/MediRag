@@ -13,8 +13,6 @@ from langchain_core.output_parsers import StrOutputParser
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
 # Global variables for singletons
 _embeddings = None
@@ -44,8 +42,7 @@ def get_embeddings():
     if _embeddings is None:
         logger.info("Loading HuggingFace embeddings model")
         _embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",
-            model_kwargs={"local_files_only": True},
+            model_name="all-MiniLM-L6-v2"
         )
         logger.info("HuggingFace embeddings model loaded")
     return _embeddings
