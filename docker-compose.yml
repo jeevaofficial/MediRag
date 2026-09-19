@@ -1,0 +1,64 @@
+version: "3.8"
+
+services:
+  backend:
+    build: ./backend
+    container_name: medirag-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://medirag:mediragpass@db:5432/medirag
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-supersecretkey_change_in_production}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - faiss_index:/app/faiss_index
+      - uploaded_docs:/app/uploaded_docs
+    networks:
+      - medirag_network
+
+  db:
+    image: postgres:16-alpine
+    container_name: medirag-db
+    environment:
+      - POSTGRES_USER=medirag
+      - POSTGRES_PASSWORD=mediragpass
+      - POSTGRES_DB=medirag
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U medirag"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - medirag_network
+
+
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: medirag-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+    depends_on:
+      - backend
+    networks:
+      - medirag_network
+
+volumes:
+  pgdata:
+  faiss_index:
+  uploaded_docs:
+
+networks:
+  medirag_network:
+    driver: bridge
