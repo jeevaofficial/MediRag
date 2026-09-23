@@ -1,17 +1,35 @@
 import os
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 
 from app.api import deps
-from app.db.database import get_db
+from app.db.database import get_db, SessionLocal
 from app.db.models import User, Document
 from app.core.config import settings
 from app.rag import rag_engine
 
 router = APIRouter()
 
+def process_document_background(doc_id: int, filepath: str, user_id: int):
+    db = SessionLocal()
+    try:
+        rag_engine.ingest_pdf(filepath, user_id)
+        doc = db.query(Document).filter(Document.id == doc_id).first()
+        if doc:
+            doc.status = "indexed"
+            db.commit()
+    except Exception as e:
+        print(f"Error indexing {filepath}: {e}")
+        doc = db.query(Document).filter(Document.id == doc_id).first()
+        if doc:
+            doc.status = "error"
+            db.commit()
+    finally:
+        db.close()
+
 @router.post("/upload")
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     current_user: User = Depends(deps.get_current_user)
@@ -54,15 +72,8 @@ async def upload_document(
     db.commit()
     db.refresh(doc)
     
-    try:
-        # In a real production app, this should be a background task (e.g. Celery or BackgroundTasks)
-        rag_engine.ingest_pdf(filepath, current_user.id)
-        doc.status = "indexed"
-    except Exception as e:
-        doc.status = "error"
-        print(f"Error indexing {filepath}: {e}")
+    background_tasks.add_task(process_document_background, doc.id, filepath, current_user.id)
     
-    db.commit()
     return {"id": doc.id, "filename": doc.filename, "status": doc.status}
 
 @router.get("/")
@@ -72,7 +83,19 @@ def list_documents(
 ):
     # Only show user's docs
     docs = db.query(Document).filter(Document.owner_id == current_user.id).all()
-    return [{"id": d.id, "filename": d.filename, "status": d.status, "owner_id": d.owner_id} for d in docs]
+    
+    # Render ephemeral storage fix: If file is missing from disk (e.g. after restart), remove from DB
+    valid_docs = []
+    for d in docs:
+        if os.path.exists(d.filepath):
+            valid_docs.append(d)
+        else:
+            db.delete(d)
+    
+    if len(valid_docs) != len(docs):
+        db.commit()
+        
+    return [{"id": d.id, "filename": d.filename, "status": d.status, "owner_id": d.owner_id} for d in valid_docs]
 
 @router.delete("/{document_id}")
 async def delete_document(
