@@ -2,6 +2,12 @@ import os
 import time
 import json
 import logging
+import warnings
+
+# Disable HuggingFace symlinks warning which causes a blocking prompt on Windows
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
