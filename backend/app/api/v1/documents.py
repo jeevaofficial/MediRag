@@ -20,10 +20,14 @@ def process_document_background(doc_id: int, filepath: str, user_id: int):
             db.commit()
     except Exception as e:
         print(f"Error indexing {filepath}: {e}")
-        doc = db.query(Document).filter(Document.id == doc_id).first()
-        if doc:
-            doc.status = "error"
-            db.commit()
+        try:
+            db.rollback()
+            doc = db.query(Document).filter(Document.id == doc_id).first()
+            if doc:
+                doc.status = "error"
+                db.commit()
+        except Exception as inner_e:
+            print(f"Failed to update error status: {inner_e}")
     finally:
         db.close()
 
