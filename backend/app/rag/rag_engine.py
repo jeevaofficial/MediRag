@@ -1,31 +1,34 @@
-import os
-import time
-import json
 import logging
-import warnings
+import os
+import re
+import time
 
 # Disable HuggingFace symlinks warning which causes a blocking prompt on Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["USE_TF"] = "0"
+os.environ["USE_TORCH"] = "1"
 
 from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Global variables for singletons
 _embeddings = None
 _llm = None
 
+
 class RAGError(RuntimeError):
     pass
+
 
 SYSTEM_PROMPT = """You are MediRAG AI, a highly accurate medical reference assistant.
 Your answers must be grounded strictly in the provided medical context.
@@ -43,20 +46,50 @@ Question:
 {question}
 """
 
+
+def _clean_text(raw_text: str) -> str:
+    if raw_text is None:
+        return ""
+    cleaned = raw_text.replace("\x00", "").replace("\ufeff", "")
+    cleaned = cleaned.replace("\r\n", "\n").replace("\r", "\n")
+    cleaned = cleaned.replace("\u00a0", " ")
+    cleaned = re.sub(r"[ \t\f\v]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"\n +", "\n", cleaned)
+    cleaned = re.sub(r" +\n", "\n", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _safe_metadata(metadata: dict, filepath: str, document_id: str | None = None):
+    safe_metadata = dict(metadata or {})
+    safe_metadata["source"] = filepath
+    safe_metadata["filename"] = os.path.basename(filepath)
+    if document_id is not None:
+        safe_metadata["document_id"] = str(document_id)
+    page_number = safe_metadata.get("page")
+    if isinstance(page_number, int):
+        safe_metadata["page_number"] = page_number + 1
+    return safe_metadata
+
+
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
-        logger.info("Loading HuggingFace embeddings model")
+        logger.info("[EMBEDDING] Loading HuggingFace embeddings model")
         _embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2"
+            model_name="all-MiniLM-L6-v2",
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": False},
         )
-        logger.info("HuggingFace embeddings model loaded")
+        logger.info("[EMBEDDING] HuggingFace embeddings model loaded")
     return _embeddings
+
 
 def get_llm():
     global _llm
     if _llm is None:
-        logger.info("Creating ChatGroq client model=%s", settings.GROQ_MODEL)
+        logger.info("[LLM] Creating ChatGroq client model=%s", settings.GROQ_MODEL)
         try:
             _llm = ChatGroq(
                 temperature=0,
@@ -64,32 +97,121 @@ def get_llm():
                 api_key=settings.GROQ_API_KEY,
             )
         except Exception as e:
-            logger.error("Failed to initialize Groq LLM: %s", e)
+            logger.error("[ERROR] Failed to initialize Groq LLM: %s", e)
             raise RAGError("Failed to initialize Groq LLM. Check your GROQ_API_KEY.")
     return _llm
 
-def ingest_pdf(filepath: str, user_id: int):
-    logger.info("Starting PDF ingestion filepath=%s user_id=%s", filepath, user_id)
-    loader = PyPDFLoader(filepath)
-    docs = loader.load()
-    logger.info("Loaded %s pages from PDF", len(docs))
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-    splits = text_splitter.split_documents(docs)
-    logger.info("Split PDF into %s chunks", len(splits))
-    
-    embeddings = get_embeddings()
-    user_index_dir = os.path.join(settings.FAISS_INDEX_PATH, str(user_id))
-    os.makedirs(user_index_dir, exist_ok=True)
-    index_file = os.path.join(user_index_dir, "index.faiss")
-    
-    if os.path.exists(index_file):
-        vectorstore = FAISS.load_local(user_index_dir, embeddings, allow_dangerous_deserialization=True)
-        vectorstore.add_documents(splits)
-    else:
-        vectorstore = FAISS.from_documents(splits, embeddings)
-    vectorstore.save_local(user_index_dir)
-    logger.info("Saved FAISS vector store after PDF ingestion for user %s", user_id)
+
+def _extract_pdf_pages(filepath: str):
+    logger.info("[EXTRACT] Starting PDF extraction filepath=%s", filepath)
+    try:
+        loader = PyPDFLoader(filepath)
+        pages = loader.load()
+    except Exception as exc:
+        message = str(exc).lower()
+        if "empty" in message or "cannot read an empty file" in message or "not a pdf" in message or "pdf read" in message:
+            logger.exception("[ERROR] PDF extraction failed for %s", filepath)
+            raise RAGError("OCR required / No extractable text") from exc
+        logger.exception("[ERROR] PDF extraction failed for %s", filepath)
+        raise RAGError(f"PDF extraction failed: {exc}") from exc
+
+    logger.info("[EXTRACT] Pages extracted: %s", len(pages))
+    cleaned_pages = []
+    for page_index, page in enumerate(pages):
+        page_text = _clean_text(page.page_content or "")
+        if not page_text:
+            logger.warning("[EXTRACT] Page %s contains no extractable text", page_index + 1)
+            continue
+        cleaned_pages.append(
+            Document(
+                page_content=page_text,
+                metadata=_safe_metadata(page.metadata or {}, filepath),
+            )
+        )
+
+    if not cleaned_pages:
+        logger.error("[ERROR] PDF contains no extractable text filepath=%s", filepath)
+        raise RAGError("OCR required / No extractable text")
+
+    return cleaned_pages
+
+
+def _chunk_pages(pages, filepath: str, document_id: str | None = None):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=80)
+    chunks = []
+    for page_index, page in enumerate(pages):
+        page_text = _clean_text(page.page_content or "")
+        if not page_text:
+            continue
+        split_docs = text_splitter.split_documents([page])
+        for chunk_index, chunk in enumerate(split_docs):
+            chunk_text = _clean_text(chunk.page_content or "")
+            if not chunk_text or len(chunk_text) < 25:
+                continue
+            metadata = _safe_metadata(chunk.metadata or {}, filepath, document_id)
+            metadata["page_number"] = (int(metadata.get("page", 0)) + 1) if isinstance(metadata.get("page"), int) else (page_index + 1)
+            metadata["chunk_index"] = chunk_index
+            chunks.append(Document(page_content=chunk_text, metadata=metadata))
+
+    if not chunks:
+        raise RAGError("No valid chunks could be created from the extracted PDF text.")
+
+    logger.info("[CHUNK] Created %s chunks for document_id=%s", len(chunks), document_id)
+    return chunks
+
+
+def ingest_pdf(filepath: str, user_id: int, document_id: str | None = None):
+    logger.info("[UPLOAD] PDF ingestion started filepath=%s user_id=%s document_id=%s", filepath, user_id, document_id)
+
+    try:
+        pages = _extract_pdf_pages(filepath)
+        chunks = _chunk_pages(pages, filepath, document_id=str(document_id) if document_id is not None else None)
+
+        embeddings = get_embeddings()
+        logger.info("[EMBEDDING] Generating embeddings for %s chunks", len(chunks))
+        embedding_vectors = embeddings.embed_documents([chunk.page_content for chunk in chunks])
+        if not embedding_vectors or any(len(vector) == 0 for vector in embedding_vectors):
+            raise RAGError("Embedding generation failed: invalid or empty vectors returned by the embedding model.")
+
+        user_index_dir = os.path.join(settings.FAISS_INDEX_PATH, str(user_id))
+        os.makedirs(user_index_dir, exist_ok=True)
+        index_file = os.path.join(user_index_dir, "index.faiss")
+
+        existing_vectorstore = None
+        if os.path.exists(index_file):
+            try:
+                existing_vectorstore = FAISS.load_local(user_index_dir, embeddings, allow_dangerous_deserialization=True)
+                docstore = existing_vectorstore.docstore._dict
+                ids_to_delete = [doc_id_key for doc_id_key, doc in docstore.items() if doc.metadata.get("source") == filepath]
+                if ids_to_delete:
+                    logger.info("[VECTOR DB] Removing %s existing vectors for the same source before re-inserting", len(ids_to_delete))
+                    existing_vectorstore.delete(ids_to_delete)
+            except Exception as exc:
+                logger.warning("[WARNING] Failed to load existing vector index for user %s: %s", user_id, exc)
+                existing_vectorstore = None
+
+        if existing_vectorstore is not None:
+            existing_vectorstore.add_documents(chunks)
+            vectorstore = existing_vectorstore
+        else:
+            vectorstore = FAISS.from_documents(chunks, embeddings)
+
+        vectorstore.save_local(user_index_dir)
+        logger.info("[VECTOR DB] Insert successful for %s vectors into user %s", len(chunks), user_id)
+
+        probe_text = chunks[0].page_content[:200]
+        retrieval_hits = vectorstore.similarity_search(probe_text, k=3)
+        if not retrieval_hits:
+            raise RAGError("Index verification failed: no chunks were retrievable after insertion.")
+
+        logger.info("[INDEX] Document indexing completed filepath=%s user_id=%s chunks=%s", filepath, user_id, len(chunks))
+        return {"chunks_created": len(chunks), "retrieval_hits": len(retrieval_hits)}
+
+    except RAGError:
+        raise
+    except Exception as exc:
+        logger.exception("[ERROR] Unexpected ingestion failure filepath=%s user_id=%s", filepath, user_id)
+        raise RAGError(f"PDF indexing failed: {exc}") from exc
 
 def delete_pdf(filepath: str, user_id: int):
     logger.info("Starting PDF deletion from FAISS filepath=%s user_id=%s", filepath, user_id)

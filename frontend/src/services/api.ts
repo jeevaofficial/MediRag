@@ -119,6 +119,16 @@ export const api = {
     return res.json();
   },
 
+  async retryDocument(id: number) {
+    const res = await fetch(`${API_URL}/documents/${id}/retry`, {
+      method: 'POST',
+      headers: getAuthHeaders()
+    });
+    handleUnauthorized(res);
+    if (!res.ok) throw new Error(await readErrorMessage(res));
+    return res.json();
+  },
+
   async deleteDocument(id: number) {
     const res = await fetch(`${API_URL}/documents/${id}`, {
       method: 'DELETE',

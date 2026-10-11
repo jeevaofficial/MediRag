@@ -21,7 +21,8 @@ class Document(Base):
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String, nullable=False)
     filepath = Column(String, nullable=False)
-    status = Column(String, default="processing") # processing, indexed, error
+    status = Column(String, default="processing", nullable=False)  # processing, completed, failed
+    processing_error = Column(Text, nullable=True)
     owner_id = Column(Integer, ForeignKey("users.id"))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 

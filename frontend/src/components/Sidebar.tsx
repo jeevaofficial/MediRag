@@ -6,7 +6,16 @@ interface Document {
   id: number;
   filename: string;
   status: string;
+  processing_error?: string | null;
 }
+
+const normalizeStatus = (status?: string) => {
+  const value = (status || '').toLowerCase();
+  if (value === 'completed' || value === 'indexed') return 'COMPLETED';
+  if (value === 'failed' || value === 'error') return 'FAILED';
+  if (value === 'processing') return 'PROCESSING';
+  return (status || 'UNKNOWN').toUpperCase();
+};
 
 export default function Sidebar({ onLogout, onClose }: { onLogout: () => void, onClose?: () => void }) {
   const [documents, setDocuments] = useState<Document[]>([]);
@@ -75,6 +84,15 @@ export default function Sidebar({ onLogout, onClose }: { onLogout: () => void, o
     }
   };
 
+  const handleRetryDocument = async (id: number) => {
+    try {
+      await api.retryDocument(id);
+      await fetchDocuments();
+    } catch (err: any) {
+      alert(err.message || "Failed to retry document");
+    }
+  };
+
   return (
     <div className="w-64 bg-slate-900 text-white flex flex-col h-full shadow-2xl z-10 w-full md:w-64">
       <div className="p-4 bg-slate-950 flex justify-between items-center border-b border-slate-800">
@@ -129,26 +147,43 @@ export default function Sidebar({ onLogout, onClose }: { onLogout: () => void, o
             </div>
           ) : (
             <ul className="space-y-2">
-              {documents.map(doc => (
-                <li key={doc.id} className="flex flex-col bg-slate-800/80 hover:bg-slate-800 p-3 rounded-xl border border-slate-700/50 transition-colors group">
-                  <div className="flex justify-between items-start">
-                    <span className="text-sm truncate font-medium text-slate-200 pr-2" title={doc.filename}>
-                      {doc.filename}
-                    </span>
-                    <button 
-                      onClick={() => handleDeleteDocument(doc.id)}
-                      className="text-slate-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity p-0.5"
-                      title="Delete document"
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  </div>
-                  <div className="flex items-center mt-2">
-                    <span className={`h-2 w-2 rounded-full mr-2 ${doc.status === 'indexed' ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.5)]' : doc.status === 'processing' ? 'bg-amber-400 animate-pulse' : 'bg-red-400'}`}></span>
-                    <span className="text-[11px] text-slate-400 uppercase tracking-wider font-medium">{doc.status}</span>
-                  </div>
-                </li>
-              ))}
+              {documents.map(doc => {
+                const normalizedStatus = normalizeStatus(doc.status);
+                const isFailed = normalizedStatus === 'FAILED';
+                return (
+                  <li key={doc.id} className="flex flex-col bg-slate-800/80 hover:bg-slate-800 p-3 rounded-xl border border-slate-700/50 transition-colors group">
+                    <div className="flex justify-between items-start">
+                      <span className="text-sm truncate font-medium text-slate-200 pr-2" title={doc.filename}>
+                        {doc.filename}
+                      </span>
+                      <button 
+                        onClick={() => handleDeleteDocument(doc.id)}
+                        className="text-slate-500 hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity p-0.5"
+                        title="Delete document"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                    <div className="flex items-center mt-2 justify-between gap-2">
+                      <div className="flex items-center min-w-0">
+                        <span className={`h-2 w-2 rounded-full mr-2 ${normalizedStatus === 'COMPLETED' ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.5)]' : normalizedStatus === 'PROCESSING' ? 'bg-amber-400 animate-pulse' : 'bg-red-400'}`}></span>
+                        <span className="text-[11px] text-slate-400 uppercase tracking-wider font-medium">{normalizedStatus}</span>
+                      </div>
+                      {isFailed && (
+                        <button
+                          onClick={() => handleRetryDocument(doc.id)}
+                          className="text-[10px] text-amber-300 border border-amber-500/40 rounded px-1.5 py-0.5 hover:bg-amber-500/10"
+                        >
+                          Retry
+                        </button>
+                      )}
+                    </div>
+                    {isFailed && doc.processing_error && (
+                      <p className="mt-2 text-[10px] text-red-300 break-words">{doc.processing_error}</p>
+                    )}
+                  </li>
+                );
+              })}
             </ul>
           )}
         </div>
