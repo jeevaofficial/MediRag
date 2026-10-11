@@ -10,15 +10,23 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
-def ensure_user_schema():
+def ensure_schema():
     inspector = inspect(engine)
-    if "users" not in inspector.get_table_names():
-        return
+    table_names = inspector.get_table_names()
 
-    columns = {column["name"] for column in inspector.get_columns("users")}
-    if "full_name" not in columns:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE users ADD COLUMN full_name VARCHAR NOT NULL DEFAULT ''"))
+    if "users" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("users")}
+        if "full_name" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE users ADD COLUMN full_name VARCHAR NOT NULL DEFAULT ''"))
+
+    if "documents" in table_names:
+        columns = {column["name"] for column in inspector.get_columns("documents")}
+        if "processing_error" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN processing_error TEXT"))
+
+ensure_user_schema = ensure_schema
 
 def get_db():
     db = SessionLocal()

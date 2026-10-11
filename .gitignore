@@ -9,3 +9,5 @@ faiss_index/
 .DS_Store
 dist/
 build/
+.vscode/
+sample_medical_report.pdf

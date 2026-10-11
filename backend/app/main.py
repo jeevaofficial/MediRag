@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1 import auth, documents, chat
-from app.db.database import engine, Base, ensure_user_schema
+from app.db.database import engine, Base, ensure_schema
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,7 +13,7 @@ logging.basicConfig(
 
 # Create tables
 Base.metadata.create_all(bind=engine)
-ensure_user_schema()
+ensure_schema()
 
 app = FastAPI(title="MediRAG AI API")
 
