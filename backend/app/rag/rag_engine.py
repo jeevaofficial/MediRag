@@ -8,6 +8,12 @@ os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
 os.environ["USE_TF"] = "0"
 os.environ["USE_TORCH"] = "1"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import FAISS
@@ -76,7 +82,17 @@ def _safe_metadata(metadata: dict, filepath: str, document_id: str | None = None
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
-        logger.info("[EMBEDDING] Loading HuggingFace embeddings model")
+        try:
+            import torch
+            torch.set_num_threads(1)
+            try:
+                torch.set_num_interop_threads(1)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        logger.info("[EMBEDDING] Loading HuggingFace embeddings model (single-thread low-memory)")
         _embeddings = HuggingFaceEmbeddings(
             model_name="all-MiniLM-L6-v2",
             model_kwargs={"device": "cpu"},
