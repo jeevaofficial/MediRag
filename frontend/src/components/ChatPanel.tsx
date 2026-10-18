@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../services/api';
 import ReactMarkdown from 'react-markdown';
 import { motion, AnimatePresence } from 'framer-motion';
@@ -16,16 +16,55 @@ interface Message {
   timestamp?: string;
 }
 
+interface KnowledgeDocument {
+  status: string;
+}
+
 export default function ChatPanel() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [loadingText, setLoadingText] = useState('Retrieving medical context...');
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
+  const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
+  const [documentsLoaded, setDocumentsLoaded] = useState(false);
+  const [documentLoadError, setDocumentLoadError] = useState('');
   
-  const messagesEndRef = useRef<HTMLDivElement>(null);
   const loadingIntervalRef = useRef<number | null>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
+  const isFetchingDocumentsRef = useRef(false);
+  const isSubmittingRef = useRef(false);
+  const hasIndexedDocuments = documents.some(
+    document => ['completed', 'indexed'].includes(document.status.toLowerCase()),
+  );
+  const isDocumentProcessing = documents.some(
+    document => ['uploaded', 'processing'].includes(document.status.toLowerCase()),
+  );
+
+  const fetchDocuments = useCallback(async () => {
+    if (isFetchingDocumentsRef.current) return;
+    isFetchingDocumentsRef.current = true;
+    try {
+      setDocuments(await api.getDocuments());
+      setDocumentLoadError('');
+    } catch (error) {
+      console.error('Failed to load document status', error);
+      setDocumentLoadError(error instanceof Error ? error.message : 'Could not load document status.');
+    } finally {
+      isFetchingDocumentsRef.current = false;
+      setDocumentsLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchDocuments();
+  }, [fetchDocuments]);
+
+  useEffect(() => {
+    if (!isDocumentProcessing) return;
+    const interval = window.setInterval(() => void fetchDocuments(), 5000);
+    return () => window.clearInterval(interval);
+  }, [fetchDocuments, isDocumentProcessing]);
 
   useEffect(() => {
     const fetchHistory = async () => {
@@ -45,15 +84,18 @@ export default function ChatPanel() {
 
   const scrollToBottom = () => {
     requestAnimationFrame(() => {
-      if (messagesEndRef.current) {
-        messagesEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+      if (chatContainerRef.current) {
+        chatContainerRef.current.scrollTo({
+          top: chatContainerRef.current.scrollHeight,
+          behavior: 'smooth',
+        });
       }
     });
   };
 
   useEffect(() => {
     scrollToBottom();
-  }, [messages, isLoading, loadingText]);
+  }, [messages, isLoading]);
 
   useEffect(() => {
     if (isLoading) {
@@ -91,8 +133,9 @@ export default function ChatPanel() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!input.trim() || isLoading) return;
+    if (!input.trim() || isLoading || isSubmittingRef.current || !hasIndexedDocuments) return;
 
+    isSubmittingRef.current = true;
     const userMessage = input.trim();
     setInput('');
     const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
@@ -125,6 +168,7 @@ export default function ChatPanel() {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       }]);
     } finally {
+      isSubmittingRef.current = false;
       setIsLoading(false);
     }
   };
@@ -257,7 +301,6 @@ export default function ChatPanel() {
               </div>
             </motion.div>
           )}
-          <div ref={messagesEndRef} className="h-4" />
         </div>
       </div>
 
@@ -270,16 +313,36 @@ export default function ChatPanel() {
               onChange={e => setInput(e.target.value)}
               placeholder="Ask a question about your documents..."
               className="w-full bg-transparent py-4 pl-6 pr-16 focus:outline-none text-gray-800 placeholder-gray-400"
-              disabled={isLoading}
+              disabled={isLoading || !hasIndexedDocuments}
             />
             <button
               type="submit"
-              disabled={isLoading || !input.trim()}
+              disabled={isLoading || !input.trim() || !hasIndexedDocuments}
               className="absolute right-2 p-2.5 rounded-full bg-blue-600 text-white hover:bg-blue-700 disabled:bg-gray-200 disabled:text-gray-400 transition-all shadow-sm"
             >
               <Send size={20} className={input.trim() && !isLoading ? 'translate-x-0.5' : ''} />
             </button>
           </form>
+          {!hasIndexedDocuments && (
+            <p role={documentLoadError ? 'alert' : undefined} className={`text-center mt-2 text-xs ${documentLoadError ? 'text-red-600' : 'text-gray-500'}`}>
+              {documentLoadError
+                ? `Could not check your knowledge base: ${documentLoadError}`
+                : !documentsLoaded
+                  ? 'Checking your knowledge base...'
+                  : isDocumentProcessing
+                    ? 'Your PDF is being indexed. You can ask questions when its status is INDEXED.'
+                    : 'Upload a valid PDF in the sidebar and wait for indexing to finish before asking a question.'}
+            </p>
+          )}
+          {documentLoadError && (
+            <button
+              type="button"
+              onClick={() => void fetchDocuments()}
+              className="block mx-auto mt-1 text-xs text-blue-600 hover:text-blue-700 underline"
+            >
+              Retry checking document status
+            </button>
+          )}
           <div className="text-center mt-2.5 mb-1">
             <p className="text-[10px] text-gray-400 font-medium">MediRAG AI can make mistakes. Verify critical information.</p>
           </div>

@@ -1,4 +1,7 @@
-const API_ROOT = (import.meta.env.VITE_API_URL || "http://localhost:8000/api/v1").replace(/\/+$/, "");
+const localDevelopmentApi = ["localhost", "127.0.0.1"].includes(window.location.hostname)
+  ? "http://127.0.0.1:8000/api/v1"
+  : "https://medirag-798u.onrender.com/api/v1";
+const API_ROOT = (import.meta.env.VITE_API_URL || localDevelopmentApi).replace(/\/+$/, "");
 const API_URL = API_ROOT.endsWith("/api/v1") ? API_ROOT : `${API_ROOT}/api/v1`;
 const CHAT_TIMEOUT_MS = 300_000;
 export const AUTH_EXPIRED_EVENT = "medirag:auth-expired";

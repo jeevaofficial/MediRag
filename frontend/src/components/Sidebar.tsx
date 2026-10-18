@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { api } from '../services/api';
 import { Trash2, X, UploadCloud, FileText, Loader2 } from 'lucide-react';
 
@@ -6,70 +6,77 @@ interface Document {
   id: number;
   filename: string;
   status: string;
+  processing_progress?: number;
   processing_error?: string | null;
 }
 
 const normalizeStatus = (status?: string) => {
   const value = (status || '').toLowerCase();
-  if (value === 'completed' || value === 'indexed') return 'COMPLETED';
+  if (value === 'completed') return 'COMPLETED';
+  if (value === 'indexed') return 'INDEXED';
   if (value === 'failed' || value === 'error') return 'FAILED';
   if (value === 'processing') return 'PROCESSING';
-  return (status || 'UNKNOWN').toUpperCase();
+  if (value === 'uploaded') return 'UPLOADED';
+  return (status || 'UPLOADED').toUpperCase();
 };
 
 export default function Sidebar({ onLogout, onClose }: { onLogout: () => void, onClose?: () => void }) {
   const [documents, setDocuments] = useState<Document[]>([]);
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadError, setUploadError] = useState('');
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const isFetchingRef = useRef(false);
 
-  const fetchDocuments = async () => {
+  const fetchDocuments = useCallback(async () => {
+    if (isFetchingRef.current) return;
+    isFetchingRef.current = true;
     try {
       const docs = await api.getDocuments();
       setDocuments(docs);
+      setUploadError('');
     } catch (e) {
       console.error(e);
+      setUploadError(e instanceof Error ? e.message : 'Could not refresh document status.');
+    } finally {
+      isFetchingRef.current = false;
     }
-  };
+  }, []);
 
   useEffect(() => {
-    fetchDocuments();
-    // Poll for status updates
-    const interval = setInterval(fetchDocuments, 5000);
+    void fetchDocuments();
+  }, [fetchDocuments]);
+
+  useEffect(() => {
+    if (!documents.some(doc => ['uploaded', 'processing'].includes(doc.status.toLowerCase()))) return;
+    const interval = window.setInterval(() => void fetchDocuments(), 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [documents, fetchDocuments]);
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    if (!file.name.toLowerCase().endsWith('.pdf') || (file.type && file.type !== 'application/pdf')) {
+      setUploadError('Only PDF files are supported. Convert DOCX files to PDF before uploading.');
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 25 * 1024 * 1024) {
+      setUploadError('The PDF is larger than the 25 MB upload limit.');
+      e.target.value = '';
+      return;
+    }
 
     setIsUploading(true);
-    setUploadProgress(0);
-    
-    // Simulate progress
-    const progressInterval = setInterval(() => {
-      setUploadProgress(prev => {
-        if (prev >= 90) {
-          clearInterval(progressInterval);
-          return 90;
-        }
-        return prev + 10;
-      });
-    }, 200);
+    setUploadError('');
 
     try {
       await api.uploadDocument(file);
-      setUploadProgress(100);
       await fetchDocuments();
     } catch (err: any) {
       console.error(err);
-      alert(err?.message || "Failed to upload document");
+      setUploadError(err?.message || "Failed to upload document");
     } finally {
-      clearInterval(progressInterval);
-      setTimeout(() => {
-        setIsUploading(false);
-        setUploadProgress(0);
-      }, 500);
+      setIsUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   };
@@ -125,14 +132,10 @@ export default function Sidebar({ onLogout, onClose }: { onLogout: () => void, o
             onChange={handleFileUpload}
           />
           
-          {isUploading && (
-            <div className="w-full bg-slate-800 rounded-full h-1.5 mt-3 overflow-hidden">
-              <div 
-                className="bg-blue-500 h-1.5 rounded-full transition-all duration-300 ease-out" 
-                style={{ width: `${uploadProgress}%` }}
-              ></div>
-            </div>
+          {uploadError && (
+            <p role="alert" className="mt-2 text-xs text-red-300 break-words">{uploadError}</p>
           )}
+
         </div>
 
         <div className="flex-1 flex flex-col">
@@ -150,6 +153,10 @@ export default function Sidebar({ onLogout, onClose }: { onLogout: () => void, o
               {documents.map(doc => {
                 const normalizedStatus = normalizeStatus(doc.status);
                 const isFailed = normalizedStatus === 'FAILED';
+                const progress = normalizedStatus === 'COMPLETED' || normalizedStatus === 'INDEXED'
+                  ? 100
+                  : Math.max(0, Math.min(99, doc.processing_progress ?? 0));
+                const isProcessing = normalizedStatus === 'PROCESSING' || normalizedStatus === 'UPLOADED';
                 return (
                   <li key={doc.id} className="flex flex-col bg-slate-800/80 hover:bg-slate-800 p-3 rounded-xl border border-slate-700/50 transition-colors group">
                     <div className="flex justify-between items-start">
@@ -166,8 +173,10 @@ export default function Sidebar({ onLogout, onClose }: { onLogout: () => void, o
                     </div>
                     <div className="flex items-center mt-2 justify-between gap-2">
                       <div className="flex items-center min-w-0">
-                        <span className={`h-2 w-2 rounded-full mr-2 ${normalizedStatus === 'COMPLETED' ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.5)]' : normalizedStatus === 'PROCESSING' ? 'bg-amber-400 animate-pulse' : 'bg-red-400'}`}></span>
-                        <span className="text-[11px] text-slate-400 uppercase tracking-wider font-medium">{normalizedStatus}</span>
+                        <span className={`h-2 w-2 rounded-full mr-2 ${normalizedStatus === 'COMPLETED' || normalizedStatus === 'INDEXED' ? 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.5)]' : isProcessing ? 'bg-amber-400 animate-pulse' : normalizedStatus === 'FAILED' ? 'bg-red-400' : 'bg-slate-400'}`}></span>
+                        <span className="text-[11px] text-slate-400 uppercase tracking-wider font-medium">
+                          {normalizedStatus} · {progress}%
+                        </span>
                       </div>
                       {isFailed && (
                         <button
@@ -178,6 +187,21 @@ export default function Sidebar({ onLogout, onClose }: { onLogout: () => void, o
                         </button>
                       )}
                     </div>
+                    {(isProcessing || normalizedStatus === 'COMPLETED' || normalizedStatus === 'INDEXED') && (
+                      <div
+                        className="w-full bg-slate-700 rounded-full h-1.5 mt-2 overflow-hidden"
+                        role="progressbar"
+                        aria-label={`${doc.filename} indexing progress`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={progress}
+                      >
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ease-out ${normalizedStatus === 'COMPLETED' || normalizedStatus === 'INDEXED' ? 'bg-emerald-400' : 'bg-blue-400'}`}
+                          style={{ width: `${progress}%` }}
+                        />
+                      </div>
+                    )}
                     {isFailed && doc.processing_error && (
                       <p className="mt-2 text-[10px] text-red-300 break-words">{doc.processing_error}</p>
                     )}

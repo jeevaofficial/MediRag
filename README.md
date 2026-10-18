@@ -64,3 +64,11 @@ npm run dev
 2. In the left sidebar, **upload a PDF** (a clinical guideline, drug monograph, textbook chapter, etc.). It's chunked, embedded, and added to the FAISS index — watch the status go `processing → indexed`.
 3. **Ask questions** in the chat panel. Answers are grounded strictly in your uploaded documents, with the exact source snippet and page shown under each answer.
 4. Upload more documents any time — the knowledge base grows incrementally; no re-indexing of prior documents is needed.
+
+The local frontend automatically connects to `http://127.0.0.1:8000/api/v1`. Set the frontend build environment variable `VITE_API_URL` to your deployed backend's API URL (for example, `https://your-backend.example/api/v1`) when deploying the frontend; do not use the local development URL in production.
+
+## PDF indexing and deployment storage
+
+Uploads are PDF-only (maximum 25 MB). DOCX files must be converted to PDF first. Scanned/image-only PDFs require OCR before upload; indexing reports an error when no text can be extracted. Document statuses are shown as `UPLOADED`, `PROCESSING`, `INDEXED`, or `FAILED`, and failed indexing can be retried from the sidebar.
+
+The API uses FastAPI background tasks and stores uploaded PDFs and per-user FAISS indexes on disk. For a separately hosted backend, configure `UPLOAD_DIR` and `FAISS_INDEX_PATH` to writable **persistent** storage, and make sure the database configured by `DATABASE_URL` persists too. Ephemeral serverless/container filesystems can lose PDFs and indexes on restart; use persistent volumes and keep both paths on the mounted volume. Set `JWT_SECRET_KEY` and `GROQ_API_KEY` in the backend environment. `GROQ_MODEL` is optional. An indexing operation that remains active for 30 minutes is marked failed so it can be retried; in-process background tasks are not a durable job queue and do not survive backend restarts.

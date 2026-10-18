@@ -25,6 +25,20 @@ def ensure_schema():
         if "processing_error" not in columns:
             with engine.begin() as conn:
                 conn.execute(text("ALTER TABLE documents ADD COLUMN processing_error TEXT"))
+        if "processing_started_at" not in columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE documents ADD COLUMN processing_started_at TIMESTAMP"))
+        if "processing_progress" not in columns:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("ALTER TABLE documents ADD COLUMN processing_progress INTEGER NOT NULL DEFAULT 0")
+                )
+                conn.execute(
+                    text(
+                        "UPDATE documents SET processing_progress = 100 "
+                        "WHERE status IN ('completed', 'indexed')"
+                    )
+                )
 
 ensure_user_schema = ensure_schema
 

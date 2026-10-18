@@ -171,7 +171,7 @@ def test_rag_query(token):
             timeout=120  # RAG can be slow
         )
         
-        success = response.status_code in [200, 422]  # 422 if no documents
+        success = response.status_code in [200, 409]  # 409 if no documents are indexed
         
         if response.status_code == 200:
             data = response.json()

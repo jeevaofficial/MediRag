@@ -36,7 +36,7 @@ print("Upload:", res.status_code, res.text)
 doc_id = res.json().get("id")
 
 print("\n5. Waiting for indexing...")
-while True:
+for _ in range(60):
     time.sleep(3)
     res = requests.get(f"{API_BASE}/documents/", headers=headers)
     docs = res.json()
@@ -45,7 +45,9 @@ while True:
         break
     doc = docs[0]
     print(f"Status: {doc['status']}")
-    if doc["status"] in ["indexed", "error"]:
+    if doc["status"] in ["completed", "failed", "indexed", "error"]:
+        if doc["status"] in ["failed", "error"]:
+            print("Indexing error:", doc.get("processing_error"))
         break
 
 print("\n6. Querying RAG...")

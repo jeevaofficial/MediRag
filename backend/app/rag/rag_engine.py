@@ -1,7 +1,9 @@
 import logging
 import os
 import re
+import threading
 import time
+from collections.abc import Callable
 
 # Disable HuggingFace symlinks warning which causes a blocking prompt on Windows
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
@@ -23,6 +25,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic.v1 import SecretStr
 
 from app.core.config import settings
 
@@ -30,10 +33,23 @@ logger = logging.getLogger(__name__)
 
 _embeddings = None
 _llm = None
+_embeddings_lock = threading.Lock()
+_llm_lock = threading.Lock()
+_vectorstore_lock = threading.RLock()
+MIN_RETRIEVAL_COSINE_SIMILARITY = 0.3
 
 
 class RAGError(RuntimeError):
     pass
+
+
+def _indexed_documents(vectorstore: FAISS) -> list[tuple[str, Document]]:
+    documents = []
+    for stored_id in vectorstore.index_to_docstore_id.values():
+        stored_document = vectorstore.docstore.search(stored_id)
+        if isinstance(stored_document, Document):
+            documents.append((stored_id, stored_document))
+    return documents
 
 
 SYSTEM_PROMPT = """You are MediRAG AI, a highly accurate medical reference assistant.
@@ -82,54 +98,57 @@ def _safe_metadata(metadata: dict, filepath: str, document_id: str | None = None
 def get_embeddings():
     global _embeddings
     if _embeddings is None:
-        try:
-            import torch
-            torch.set_num_threads(1)
-            try:
-                torch.set_num_interop_threads(1)
-            except Exception:
-                pass
-        except Exception:
-            pass
+        with _embeddings_lock:
+            if _embeddings is None:
+                try:
+                    import torch
+                    torch.set_num_threads(1)
+                    try:
+                        torch.set_num_interop_threads(1)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
 
-        logger.info("[EMBEDDING] Loading HuggingFace embeddings model (single-thread low-memory)")
-        _embeddings = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": False},
-        )
-        logger.info("[EMBEDDING] HuggingFace embeddings model loaded")
+                logger.info("[EMBEDDING] Loading HuggingFace embeddings model (single-thread low-memory)")
+                _embeddings = HuggingFaceEmbeddings(
+                    model_name="all-MiniLM-L6-v2",
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={"normalize_embeddings": False},
+                )
+                logger.info("[EMBEDDING] HuggingFace embeddings model loaded")
     return _embeddings
 
 
 def get_llm():
     global _llm
     if _llm is None:
-        logger.info("[LLM] Creating ChatGroq client model=%s", settings.GROQ_MODEL)
-        try:
-            _llm = ChatGroq(
-                temperature=0,
-                model_name=settings.GROQ_MODEL,
-                api_key=settings.GROQ_API_KEY,
-            )
-        except Exception as e:
-            logger.error("[ERROR] Failed to initialize Groq LLM: %s", e)
-            raise RAGError("Failed to initialize Groq LLM. Check your GROQ_API_KEY.")
+        with _llm_lock:
+            if _llm is None:
+                logger.info("[LLM] Creating ChatGroq client model=%s", settings.GROQ_MODEL)
+                try:
+                    _llm = ChatGroq(
+                        temperature=0,
+                        model=settings.GROQ_MODEL,
+                        stop_sequences=None,
+                        api_key=SecretStr(settings.GROQ_API_KEY) if settings.GROQ_API_KEY else None,
+                    )
+                except Exception:
+                    logger.exception("Failed to initialize Groq LLM")
+                    raise RAGError("Answer generation is not configured. Contact the administrator.")
     return _llm
 
 
 def _extract_pdf_pages(filepath: str):
     logger.info("[EXTRACT] Starting PDF extraction filepath=%s", filepath)
+    if os.path.getsize(filepath) == 0:
+        raise RAGError("OCR required / No extractable text")
     try:
         loader = PyPDFLoader(filepath)
         pages = loader.load()
     except Exception as exc:
-        message = str(exc).lower()
-        if "empty" in message or "cannot read an empty file" in message or "not a pdf" in message or "pdf read" in message:
-            logger.exception("[ERROR] PDF extraction failed for %s", filepath)
-            raise RAGError("OCR required / No extractable text") from exc
         logger.exception("[ERROR] PDF extraction failed for %s", filepath)
-        raise RAGError(f"PDF extraction failed: {exc}") from exc
+        raise RAGError("The PDF could not be read during text extraction. Check that it is not corrupted or password-protected.") from exc
 
     logger.info("[EXTRACT] Pages extracted: %s", len(pages))
     cleaned_pages = []
@@ -176,49 +195,117 @@ def _chunk_pages(pages, filepath: str, document_id: str | None = None):
     return chunks
 
 
-def ingest_pdf(filepath: str, user_id: int, document_id: str | None = None):
+def ingest_pdf(
+    filepath: str,
+    user_id: int,
+    document_id: int | str | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+):
     logger.info("[UPLOAD] PDF ingestion started filepath=%s user_id=%s document_id=%s", filepath, user_id, document_id)
 
     try:
+        if progress_callback:
+            progress_callback(5)
         pages = _extract_pdf_pages(filepath)
+        if progress_callback:
+            progress_callback(20)
         chunks = _chunk_pages(pages, filepath, document_id=str(document_id) if document_id is not None else None)
+        if progress_callback:
+            progress_callback(30)
 
-        embeddings = get_embeddings()
         logger.info("[EMBEDDING] Generating embeddings for %s chunks", len(chunks))
-        embedding_vectors = embeddings.embed_documents([chunk.page_content for chunk in chunks])
-        if not embedding_vectors or any(len(vector) == 0 for vector in embedding_vectors):
+        try:
+            embeddings = get_embeddings()
+            embedding_vectors = embeddings.embed_documents([chunk.page_content for chunk in chunks])
+        except Exception as exc:
+            logger.exception("Embedding generation failed document_id=%s", document_id)
+            raise RAGError("Embedding generation failed. Check the configured embedding model and retry the PDF.") from exc
+        if (
+            len(embedding_vectors) != len(chunks)
+            or not embedding_vectors
+            or any(not vector for vector in embedding_vectors)
+            or len({len(vector) for vector in embedding_vectors}) != 1
+        ):
             raise RAGError("Embedding generation failed: invalid or empty vectors returned by the embedding model.")
+        if progress_callback:
+            progress_callback(65)
 
         user_index_dir = os.path.join(settings.FAISS_INDEX_PATH, str(user_id))
         os.makedirs(user_index_dir, exist_ok=True)
         index_file = os.path.join(user_index_dir, "index.faiss")
+        text_embeddings = list(zip(
+            [chunk.page_content for chunk in chunks],
+            embedding_vectors,
+        ))
+        chunk_metadata = [chunk.metadata for chunk in chunks]
 
-        existing_vectorstore = None
-        if os.path.exists(index_file):
-            try:
-                existing_vectorstore = FAISS.load_local(user_index_dir, embeddings, allow_dangerous_deserialization=True)
-                docstore = existing_vectorstore.docstore._dict
-                ids_to_delete = [doc_id_key for doc_id_key, doc in docstore.items() if doc.metadata.get("source") == filepath]
-                if ids_to_delete:
-                    logger.info("[VECTOR DB] Removing %s existing vectors for the same source before re-inserting", len(ids_to_delete))
-                    existing_vectorstore.delete(ids_to_delete)
-            except Exception as exc:
-                logger.warning("[WARNING] Failed to load existing vector index for user %s: %s", user_id, exc)
-                existing_vectorstore = None
+        try:
+            with _vectorstore_lock:
+                if os.path.exists(index_file):
+                    try:
+                        existing_vectorstore = FAISS.load_local(
+                            user_index_dir,
+                            embeddings,
+                            allow_dangerous_deserialization=True,
+                        )
+                    except Exception as exc:
+                        logger.exception("Could not load existing FAISS index for user_id=%s", user_id)
+                        raise RAGError("The existing search index could not be loaded. No indexed documents were changed; contact the administrator.") from exc
 
-        if existing_vectorstore is not None:
-            existing_vectorstore.add_documents(chunks)
-            vectorstore = existing_vectorstore
-        else:
-            vectorstore = FAISS.from_documents(chunks, embeddings)
+                    ids_to_delete = [
+                        stored_id
+                        for stored_id, stored_doc in _indexed_documents(existing_vectorstore)
+                        if (
+                            document_id is not None
+                            and stored_doc.metadata.get("document_id") == str(document_id)
+                        ) or stored_doc.metadata.get("source") == filepath
+                    ]
+                    if ids_to_delete:
+                        logger.info("Removing %s stale chunks before re-indexing document_id=%s", len(ids_to_delete), document_id)
+                        existing_vectorstore.delete(ids_to_delete)
+                    existing_vectorstore.add_embeddings(text_embeddings, metadatas=chunk_metadata)
+                    vectorstore = existing_vectorstore
+                else:
+                    vectorstore = FAISS.from_embeddings(
+                        text_embeddings,
+                        embeddings,
+                        metadatas=chunk_metadata,
+                    )
 
-        vectorstore.save_local(user_index_dir)
+                if progress_callback:
+                    progress_callback(80)
+                vectorstore.save_local(user_index_dir)
+                if progress_callback:
+                    progress_callback(90)
+                document_chunks = [
+                    stored_doc
+                    for _, stored_doc in _indexed_documents(vectorstore)
+                    if (
+                        document_id is not None
+                        and stored_doc.metadata.get("document_id") == str(document_id)
+                    ) or stored_doc.metadata.get("source") == filepath
+                ]
+                if len(document_chunks) < len(chunks):
+                    raise RAGError("Index verification failed: not all document chunks were saved.")
+                retrieval_hits = vectorstore.similarity_search(
+                    chunks[0].page_content[:200],
+                    k=min(3, len(chunks)),
+                    filter=lambda metadata: (
+                        metadata.get("document_id") == str(document_id)
+                        if document_id is not None
+                        else metadata.get("source") == filepath
+                    ),
+                )
+                if not retrieval_hits:
+                    raise RAGError("Index verification failed: this document's chunks could not be retrieved after saving.")
+                if progress_callback:
+                    progress_callback(98)
+        except RAGError:
+            raise
+        except Exception as exc:
+            logger.exception("Vector storage failed document_id=%s user_id=%s", document_id, user_id)
+            raise RAGError("Vector storage failed while saving the PDF chunks. Please retry; technical details were logged.") from exc
         logger.info("[VECTOR DB] Insert successful for %s vectors into user %s", len(chunks), user_id)
-
-        probe_text = chunks[0].page_content[:200]
-        retrieval_hits = vectorstore.similarity_search(probe_text, k=3)
-        if not retrieval_hits:
-            raise RAGError("Index verification failed: no chunks were retrievable after insertion.")
 
         logger.info("[INDEX] Document indexing completed filepath=%s user_id=%s chunks=%s", filepath, user_id, len(chunks))
         return {"chunks_created": len(chunks), "retrieval_hits": len(retrieval_hits)}
@@ -227,7 +314,7 @@ def ingest_pdf(filepath: str, user_id: int, document_id: str | None = None):
         raise
     except Exception as exc:
         logger.exception("[ERROR] Unexpected ingestion failure filepath=%s user_id=%s", filepath, user_id)
-        raise RAGError(f"PDF indexing failed: {exc}") from exc
+        raise RAGError("PDF indexing failed unexpectedly. Please retry the upload; technical details were logged.") from exc
 
 def delete_pdf(filepath: str, user_id: int):
     logger.info("Starting PDF deletion from FAISS filepath=%s user_id=%s", filepath, user_id)
@@ -239,21 +326,21 @@ def delete_pdf(filepath: str, user_id: int):
 
     try:
         embeddings = get_embeddings()
-        vectorstore = FAISS.load_local(user_index_dir, embeddings, allow_dangerous_deserialization=True)
-        docstore = vectorstore.docstore._dict
-        ids_to_delete = []
-        
-        for doc_id, doc in docstore.items():
-            if doc.metadata.get("source") == filepath:
-                ids_to_delete.append(doc_id)
-                
-        if ids_to_delete:
-            logger.info("Deleting %s chunks from FAISS for %s", len(ids_to_delete), filepath)
-            vectorstore.delete(ids_to_delete)
-            vectorstore.save_local(user_index_dir)
-            logger.info("FAISS vector store saved after deletion")
-        else:
-            logger.info("No chunks found in FAISS for %s", filepath)
+        with _vectorstore_lock:
+            vectorstore = FAISS.load_local(user_index_dir, embeddings, allow_dangerous_deserialization=True)
+            ids_to_delete = [
+                doc_id
+                for doc_id, doc in _indexed_documents(vectorstore)
+                if doc.metadata.get("source") == filepath
+            ]
+
+            if ids_to_delete:
+                logger.info("Deleting %s chunks for a removed document", len(ids_to_delete))
+                vectorstore.delete(ids_to_delete)
+                vectorstore.save_local(user_index_dir)
+                logger.info("FAISS vector store saved after deletion")
+            else:
+                logger.info("No chunks found for the removed document")
     except Exception as e:
         logger.error("Failed to delete from FAISS: %s", e)
 
@@ -281,7 +368,24 @@ def usable_docs(docs):
         if doc.page_content.strip() and doc.page_content.strip().lower() != "init"
     ]
 
-def generate_answer(query: str, user_id: int):
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right) or not left or not right:
+        return 0.0
+    dot_product = sum(a * b for a, b in zip(left, right))
+    left_norm = sum(value * value for value in left) ** 0.5
+    right_norm = sum(value * value for value in right) ** 0.5
+    if not left_norm or not right_norm:
+        return 0.0
+    return dot_product / (left_norm * right_norm)
+
+
+def generate_answer(
+    query: str,
+    user_id: int,
+    indexed_document_ids: list[int] | None = None,
+    indexed_document_sources: list[str] | None = None,
+):
     started_at = time.perf_counter()
     logger.info("RAG generation started query_length=%s user_id=%s", len(query), user_id)
     
@@ -289,19 +393,39 @@ def generate_answer(query: str, user_id: int):
         user_index_dir = os.path.join(settings.FAISS_INDEX_PATH, str(user_id))
         index_file = os.path.join(user_index_dir, "index.faiss")
         if not os.path.exists(index_file):
-            raise RAGError("No indexed documents found. Upload a valid PDF first and wait until its status becomes indexed.")
+            raise RAGError("Your documents are marked indexed, but their search index is unavailable. Retry indexing or upload the PDFs again.")
+        if not indexed_document_ids:
+            raise RAGError("No indexed PDFs are available. Upload a valid PDF and wait until indexing is complete.")
 
         embeddings = get_embeddings()
-        vectorstore = FAISS.load_local(user_index_dir, embeddings, allow_dangerous_deserialization=True)
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 10})
-
+        allowed_document_ids = {str(document_id) for document_id in indexed_document_ids}
+        allowed_sources = set(indexed_document_sources or [])
         retrieval_started_at = time.perf_counter()
-        docs = usable_docs(retriever.invoke(query))
+        with _vectorstore_lock:
+            vectorstore = FAISS.load_local(user_index_dir, embeddings, allow_dangerous_deserialization=True)
+            docs = usable_docs(vectorstore.similarity_search(
+                query,
+                k=10,
+                filter=lambda metadata: (
+                    metadata.get("document_id") in allowed_document_ids
+                    or metadata.get("source") in allowed_sources
+                ),
+            ))
+        if docs:
+            query_embedding = embeddings.embed_query(query)
+            document_embeddings = embeddings.embed_documents([doc.page_content for doc in docs])
+            if len(document_embeddings) != len(docs):
+                raise RAGError("Could not verify the relevance of retrieved PDF passages. Please try again.")
+            docs = [
+                doc
+                for doc, embedding in zip(docs, document_embeddings)
+                if _cosine_similarity(query_embedding, embedding) >= MIN_RETRIEVAL_COSINE_SIMILARITY
+            ]
         retrieval_time = time.perf_counter() - retrieval_started_at
         logger.info("FAISS retrieval completed docs=%s duration=%.2fs", len(docs), retrieval_time)
 
         if not docs:
-            raise RAGError("No usable document content was found. Upload a valid text-based PDF and wait until it is indexed.")
+            return "I could not find relevant information in your indexed PDFs for this question.", []
 
         context = format_docs(docs)
         
@@ -330,5 +454,5 @@ def generate_answer(query: str, user_id: int):
         logger.exception("RAG error")
         raise
     except Exception as exc:
-        logger.exception("Unexpected RAG answer generation failure")
-        raise RAGError(f"Failed to generate answer from Groq API: {exc}") from exc
+        logger.exception("Unexpected RAG answer generation failure user_id=%s", user_id)
+        raise RAGError("Answer generation failed. Please try again shortly; the technical error was logged.") from exc
